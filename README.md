@@ -1,4 +1,4 @@
-# django-subscriptions
+# mroudai-django-subscriptions
 
 Reusable Django app for plans, subscriptions, entitlements, and usage limits. It does **not** process payments.
 
@@ -14,7 +14,7 @@ Reusable Django app for plans, subscriptions, entitlements, and usage limits. It
 ## Installation
 
 ```bash
-pip install django-subscriptions
+pip install mroudai-django-subscriptions
 ```
 
 Add to `INSTALLED_APPS`:
@@ -144,10 +144,24 @@ The Django admin registers plans, subscriptions, overrides, and usage counters. 
 Tests (using SQLite by default):
 
 ```bash
-python -m django test subscriptions --settings=subscriptions.tests.settings
+python test django-subscriptions
 ```
 
 SQLite works for development; PostgreSQL is recommended for production.
+
+### Release to PyPI
+
+Install build tooling:
+
+```bash
+python install_upload_dependencies.py
+```
+
+Build and upload (requires `TWINE_USERNAME`/`TWINE_PASSWORD` or `TWINE_TOKEN`):
+
+```bash
+python upload.py
+```
 
 ## Licence
 

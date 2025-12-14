@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "django-subscriptions"
+name = "mroudai-django-subscriptions"
 version = "0.1.0"
 description = "Plans, entitlements, and usage tracking for Django SaaS apps."
 readme = "README.md"
@@ -25,7 +25,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/django-subscriptions"
+Homepage = "https://github.com/Kevin-Oudai/django-subscription"
 
 [tool.setuptools.packages.find]
 where = ["."]
