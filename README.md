@@ -1,168 +1,59 @@
-# mroudai-django-subscriptions
+# Luk It Hyah Subscriptions
 
-Reusable Django app for plans, subscriptions, entitlements, and usage limits. It does **not** process payments.
+Business subscriptions for the Luk It Hyah Trinidad classifieds platform. This app listens to paid orders, activates/renews subscriptions, and exposes entitlements to the rest of the system. Payments remain the source of truth; this app never charges cards directly.
 
-## Features
+## Data Model
 
-- Plans with feature flags and numeric limits.
-- Subscriptions scoped to a tenant or user.
-- Deterministic entitlement resolution (`resolve_entitlements`).
-- Optional per-tenant/user overrides and metered usage tracking.
-- Grace periods and trials with sensible defaults.
-- Django admin for plans, subscriptions, overrides, and usage counters.
+- `SubscriptionPlan`: defines packages (`key`, price info, billing period, entitlements such as `max_active_listings`, `featured_credits_per_period`, `badge_label`, `priority_support`, `can_add_multiple_staff`).
+- `SubscriptionProduct`: maps payment SKUs to plans and a number of days (`period_days`) to add when paid.
+- `UserSubscription`: current state for a user (`status` active/expired/cancelled, `current_period_start`, `current_period_end`, `last_paid_order_reference`). One active row per user enforced by constraint.
+- `SubscriptionCreditLedger`: append-only ledger for featured credits (`change` +N or -N, `reason`, optional order reference or listing id). Balance is the sum of `change`.
+- `ProcessedSubscriptionOrder`: idempotency guard so the same order reference is never processed twice.
 
-## Installation
+## Activation & Renewal Flow
 
-```bash
-pip install mroudai-django-subscriptions
-```
+1) The payments app emits `payments.order_paid` with an order containing items.  
+2) `subscriptions.signals.on_order_paid` inspects each item. If `item.sku` matches an active `SubscriptionProduct`, it calls `activate_or_renew_subscription_from_order_item(order, transaction, item, user)`.
+3) `activate_or_renew_subscription_from_order_item`:
+   - Resolves the product to a plan and period.
+   - Aborts if the order reference was already recorded in `ProcessedSubscriptionOrder` (idempotent).
+   - If the user has an active subscription on the same plan, extends `current_period_end` by `period_days` and shifts `current_period_start` to the previous end.
+   - If the user has a different active plan, expires it immediately and creates a new subscription starting now.
+   - If no active subscription exists, creates a fresh one starting now.
+   - Records `last_paid_order_reference` and logs a credit grant if the plan includes featured credits.
 
-Add to `INSTALLED_APPS`:
+## SKU Contract
 
-```python
-INSTALLED_APPS = [
-    # ...
-    "subscriptions",
-]
-```
+- Every billable subscription SKU in the payments catalog must exist as an active `SubscriptionProduct` with the correct `plan` and `period_days` (e.g., `BUS_SUB_MONTH_BASIC` → 30 days on plan `business_basic`).  
+- Order items must expose `.sku` (or `.product_sku`) and orders should provide a stable `reference` used for idempotency.
 
-Run migrations:
+## Entitlements API (for other apps)
 
-```bash
-python manage.py migrate subscriptions
-```
+Import from `subscriptions.entitlements`:
 
-## Settings
+- `get_active_subscription(user) -> UserSubscription | None`
+- `has_active_subscription(user) -> bool`
+- `get_entitlements(user) -> dict` returns `max_active_listings`, `featured_credits_balance`, `badge_label`, `priority_support`.
+- `can_post_listing(user) -> (bool, reason)` (currently enforces active subscription and returns a reason string; hook classifieds limits here later).
+- `consume_featured_credit(user, listing_id, reason) -> bool` subtracts one featured credit if balance > 0 and records the ledger entry.
 
-```python
-SUBSCRIPTIONS_TENANT_MODEL = None        # e.g. "tenants.Tenant" or None
-SUBSCRIPTIONS_USER_MODEL = None          # defaults to AUTH_USER_MODEL
-SUBSCRIPTIONS_DEFAULT_PLAN_SLUG = "free"
-SUBSCRIPTIONS_TRIAL_DAYS_DEFAULT = 14
-SUBSCRIPTIONS_GRACE_DAYS_DEFAULT = 7
-SUBSCRIPTIONS_ENABLE_OVERRIDES = True
-SUBSCRIPTIONS_ENABLE_USAGE = True
-```
+No other app needs to touch subscription internals; check entitlements and ledger balances through this API.
 
-Tenancy rules:
-- If `SUBSCRIPTIONS_TENANT_MODEL` is set, subscriptions are tenant-first; user is optional for attribution.
-- If it is not set, subscriptions are user-scoped.
+## Credit Ledger
 
-## Defining plans
+Credits are granted on activation/renewal (and optionally via the `grant_monthly_credits` command). Consumption always writes a `SubscriptionCreditLedger` row with `change = -1`. Balance for a subscription is `sum(change)` for entries with `credit_type="featured"`.
 
-Plans are static and hold flags + limits:
+## Operations
 
-```python
-from subscriptions.models import Plan
+- **Expiry:** run `expire_due_subscriptions` (or a periodic task calling it) to mark subscriptions with `current_period_end <= now` as expired. Entitlement helpers call it before lookups to keep status in sync.
+- **Monthly grants:** `python manage.py grant_monthly_credits` grants featured credits at the start of a billing period (idempotent per day). Activation/renewal already grants credits; the command is a safety net.
+- **Admin:** manage plans/products, expire subscriptions, and view the append-only ledger. Processed orders are read-only.
 
-Plan.objects.create(
-    name="Free",
-    slug="free",
-    features={"booking_ui": True, "multi_staff": False},
-    limits={"providers_max": 1, "bookings_per_month": 50},
-)
-```
+## Tests
 
-Features must be booleans. Limits must be integers `>= 0` or `None` for unlimited.
-
-## Assigning subscriptions
-
-```python
-from subscriptions.services import assign_plan
-
-# user-mode example
-subscription = assign_plan(plan="pro", user=request.user)
-```
-
-This expires any current subscription for the same tenant/user and starts a new one. Trials default to `SUBSCRIPTIONS_TRIAL_DAYS_DEFAULT`.
-
-Cancel with optional grace:
-
-```python
-from subscriptions.services import cancel_subscription
-
-cancel_subscription(subscription, at_period_end=False)
-```
-
-## Resolving entitlements
-
-```python
-from subscriptions.selectors import resolve_entitlements
-
-entitlements = resolve_entitlements(user=request.user)
-
-entitlements == {
-    "features": {"booking_ui": True, ...},
-    "limits": {"bookings_per_month": 50, ...},
-    "status": "ACTIVE",  # TRIAL/GRACE/EXPIRED etc determined by dates
-}
-```
-
-## Overrides (optional)
-
-If `SUBSCRIPTIONS_ENABLE_OVERRIDES` is `True`, use the admin or create `EntitlementOverride` rows to tweak features/limits per tenant or user. Overrides are applied on top of the plan.
-
-## Usage tracking (optional)
-
-If `SUBSCRIPTIONS_ENABLE_USAGE` is `True`, increment and enforce limits for keys ending with `_per_month`:
-
-```python
-from subscriptions.services import increment_usage, enforce_limit
-
-enforce_limit(key="bookings_per_month", user=request.user)
-increment_usage(key="bookings_per_month", user=request.user)
-```
-
-`check_limit` returns `(allowed, remaining)`; `enforce_limit` raises `ValidationError` if exceeded.
-
-## Decorators
-
-```python
-from subscriptions.services import require_feature, require_limit
-
-@require_feature("booking_ui")
-def create_booking(*, user, **kwargs):
-    ...
-
-@require_limit("bookings_per_month")
-def make_booking(*, user, **kwargs):
-    ...
-```
-
-## Admin
-
-The Django admin registers plans, subscriptions, overrides, and usage counters. JSON fields use a simple textarea for quick editing.
-
-## What this app deliberately does not do
-
-- No payment gateway integration (PayWise/Stripe/etc.).
-- No invoicing or receipts.
-- No domain-specific booking logic.
-
-## Development
-
-Tests (using SQLite by default):
-
-```bash
-python test django-subscriptions
-```
-
-SQLite works for development; PostgreSQL is recommended for production.
-
-### Release to PyPI
-
-Install build tooling:
-
-```bash
-python install_upload_dependencies.py
-```
-
-Build and upload (requires `TWINE_USERNAME`/`TWINE_PASSWORD` or `TWINE_TOKEN`):
-
-```bash
-python upload.py
-```
-
-## Licence
-
-MIT
+Expected behaviours covered by tests:
+- Activation creates an active subscription with the correct period end.
+- Renewals extend periods; plan changes replace the active subscription.
+- Idempotency prevents double-processing the same order.
+- Ledger grants featured credits and consumption stops at zero.
+- Expiry marks overdue subscriptions as expired.

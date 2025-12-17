@@ -35,5 +35,4 @@ TEMPLATES = [
         },
     }
 ]
-SUBSCRIPTIONS_TENANT_MODEL = "auth.User"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

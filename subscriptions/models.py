@@ -1,232 +1,150 @@
 from __future__ import annotations
 
-import calendar
-from datetime import date
+import uuid
+from datetime import timedelta
 
-from django.apps import apps
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
-from . import conf
 
-TENANT_MODEL_LABEL = conf.tenant_model_label()
-USER_MODEL_LABEL = conf.user_model_label()
-
-
-def _tenant_fk_kwargs(related_name: str):
-    if not TENANT_MODEL_LABEL:
-        return None
-    return {
-        "to": TENANT_MODEL_LABEL,
-        "on_delete": models.CASCADE,
-        "null": True,
-        "blank": True,
-        "related_name": related_name,
-    }
-
-
-HAS_TENANT = TENANT_MODEL_LABEL is not None
+class BillingPeriod(models.TextChoices):
+    MONTHLY = "monthly", "Monthly"
+    YEARLY = "yearly", "Yearly"
 
 
 class SubscriptionStatus(models.TextChoices):
-    TRIAL = "TRIAL", "Trial"
-    ACTIVE = "ACTIVE", "Active"
-    PAST_DUE = "PAST_DUE", "Past due"
-    GRACE = "GRACE", "Grace"
-    CANCELLED = "CANCELLED", "Cancelled"
-    EXPIRED = "EXPIRED", "Expired"
+    ACTIVE = "active", "Active"
+    EXPIRED = "expired", "Expired"
+    CANCELLED = "cancelled", "Cancelled"
 
 
-class Plan(models.Model):
+class SubscriptionPlan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    key = models.SlugField(unique=True)
     name = models.CharField(max_length=150)
-    slug = models.SlugField(unique=True)
     description = models.TextField(blank=True)
+    price_ttd = models.DecimalField(max_digits=10, decimal_places=2)
+    billing_period = models.CharField(max_length=20, choices=BillingPeriod.choices)
     is_active = models.BooleanField(default=True)
-    is_public = models.BooleanField(default=True)
-    sort_order = models.IntegerField(default=0)
-    features = models.JSONField(default=dict, blank=True)
-    limits = models.JSONField(default=dict, blank=True)
+    max_active_listings = models.IntegerField(null=True, blank=True)
+    featured_credits_per_period = models.PositiveIntegerField(default=0)
+    badge_label = models.CharField(max_length=150, blank=True)
+    priority_support = models.BooleanField(default=False)
+    can_add_multiple_staff = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["sort_order", "slug"]
-        indexes = [
-            models.Index(fields=["is_active", "sort_order"]),
-        ]
+        ordering = ["name"]
 
     def __str__(self) -> str:
-        return f"{self.name}"
+        return self.name
 
     def clean(self):
-        errors = {}
-        features = self.features or {}
-        limits = self.limits or {}
-
-        if not isinstance(features, dict):
-            errors["features"] = "Features must be a mapping of flags."
-        else:
-            for key, value in features.items():
-                if not isinstance(key, str):
-                    errors["features"] = "Feature keys must be strings."
-                    break
-                if not isinstance(value, bool):
-                    errors["features"] = f"Feature '{key}' must be a boolean."
-                    break
-
-        if not isinstance(limits, dict):
-            errors["limits"] = "Limits must be a mapping of numeric limits."
-        else:
-            for key, value in limits.items():
-                if not isinstance(key, str):
-                    errors["limits"] = "Limit keys must be strings."
-                    break
-                if value is not None:
-                    if not isinstance(value, int):
-                        errors["limits"] = f"Limit '{key}' must be an integer or null for unlimited."
-                        break
-                    if value < 0:
-                        errors["limits"] = f"Limit '{key}' must be zero or greater."
-                        break
-
-        if errors:
-            raise ValidationError(errors)
+        if self.max_active_listings is not None and self.max_active_listings < 0:
+            raise ValidationError("max_active_listings cannot be negative.")
 
 
-class Subscription(models.Model):
-    plan = models.ForeignKey(Plan, on_delete=models.PROTECT, related_name="subscriptions")
-    if HAS_TENANT:
-        tenant = models.ForeignKey(**_tenant_fk_kwargs("subscription_subscriptions"))
+class SubscriptionProduct(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sku = models.CharField(max_length=150, unique=True)
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.PROTECT, related_name="products")
+    period_days = models.PositiveIntegerField()
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sku"]
+
+    def __str__(self) -> str:
+        return f"{self.sku} -> {self.plan.key}"
+
+
+class UserSubscription(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
-        USER_MODEL_LABEL,
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="subscription_user_subscriptions",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="subscriptions"
     )
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.PROTECT, related_name="user_subscriptions")
     status = models.CharField(
         max_length=20, choices=SubscriptionStatus.choices, default=SubscriptionStatus.ACTIVE
     )
-    starts_at = models.DateTimeField()
-    ends_at = models.DateTimeField(null=True, blank=True)
-    trial_ends_at = models.DateTimeField(null=True, blank=True)
-    grace_ends_at = models.DateTimeField(null=True, blank=True)
-    cancel_at_period_end = models.BooleanField(default=True)
-    external_reference = models.CharField(max_length=255, blank=True)
-    metadata = models.JSONField(default=dict, blank=True)
+    started_at = models.DateTimeField()
+    current_period_start = models.DateTimeField()
+    current_period_end = models.DateTimeField(db_index=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    last_paid_order_reference = models.CharField(max_length=255, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-starts_at", "-created_at"]
-        indexes = [
-            models.Index(fields=["status", "starts_at"]),
-        ]
-
-    def __str__(self) -> str:
-        label = getattr(self, "tenant", None) or self.user
-        return f"{label} -> {self.plan}"
-
-
-class EntitlementOverride(models.Model):
-    if HAS_TENANT:
-        tenant = models.ForeignKey(**_tenant_fk_kwargs("subscription_entitlement_overrides"))
-    user = models.ForeignKey(
-        USER_MODEL_LABEL,
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="subscription_user_entitlement_overrides",
-    )
-    feature_key = models.CharField(max_length=150)
-    feature_enabled = models.BooleanField(null=True)
-    limit_key = models.CharField(max_length=150, blank=True)
-    limit_value = models.IntegerField(null=True, blank=True)
-    note = models.CharField(max_length=255, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
+        ordering = ["-current_period_end", "-created_at"]
         constraints = [
-            *(
-                [
-                    models.UniqueConstraint(
-                        fields=["tenant", "feature_key"], name="subscriptions_feature_override_tenant"
-                    ),
-                    models.UniqueConstraint(
-                        fields=["tenant", "limit_key"], name="subscriptions_limit_override_tenant"
-                    ),
-                ]
-                if HAS_TENANT
-                else []
-            ),
             models.UniqueConstraint(
-                fields=["user", "feature_key"], name="subscriptions_feature_override_user"
-            ),
-            models.UniqueConstraint(
-                fields=["user", "limit_key"], name="subscriptions_limit_override_user"
+                fields=["user"],
+                condition=Q(status=SubscriptionStatus.ACTIVE),
+                name="unique_active_subscription_per_user",
             ),
         ]
 
     def __str__(self) -> str:
-        subject = getattr(self, "tenant", None) or self.user
-        return f"Override for {subject}"
+        return f"{self.user} -> {self.plan}"
+
+    def is_active(self, at=None) -> bool:
+        at = at or timezone.now()
+        return self.status == SubscriptionStatus.ACTIVE and self.current_period_end > at
+
+    def mark_expired(self, at=None):
+        self.status = SubscriptionStatus.EXPIRED
+        self.current_period_end = at or self.current_period_end
+        self.save(update_fields=["status", "current_period_end", "updated_at"])
+
+    def extend(self, days: int):
+        self.current_period_start = self.current_period_end
+        self.current_period_end = self.current_period_end + timedelta(days=days)
+        self.save(update_fields=["current_period_start", "current_period_end", "updated_at"])
 
 
-class UsageCounter(models.Model):
-    if HAS_TENANT:
-        tenant = models.ForeignKey(**_tenant_fk_kwargs("subscription_usage_counters"))
-    user = models.ForeignKey(
-        USER_MODEL_LABEL,
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="subscription_user_usage_counters",
+class SubscriptionCreditLedger(models.Model):
+    class CreditType(models.TextChoices):
+        FEATURED = "featured", "Featured"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="subscription_credit_entries")
+    subscription = models.ForeignKey(
+        UserSubscription, on_delete=models.PROTECT, related_name="credit_entries"
     )
-    key = models.CharField(max_length=150)
-    period_start = models.DateField()
-    period_end = models.DateField()
-    used = models.PositiveIntegerField(default=0)
+    credit_type = models.CharField(max_length=50, choices=CreditType.choices)
+    change = models.IntegerField()
+    reason = models.CharField(max_length=255)
+    related_order_reference = models.CharField(max_length=255, null=True, blank=True)
+    related_listing_id = models.UUIDField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-period_start", "-created_at"]
-        constraints = [
-            *(
-                [
-                    models.UniqueConstraint(
-                        fields=["tenant", "key", "period_start", "period_end"],
-                        name="subscriptions_usage_tenant_period_key",
-                    )
-                ]
-                if HAS_TENANT
-                else []
-            ),
-            models.UniqueConstraint(
-                fields=["user", "key", "period_start", "period_end"],
-                name="subscriptions_usage_user_period_key",
-            ),
-        ]
+        ordering = ["-created_at"]
 
     def __str__(self) -> str:
-        subject = getattr(self, "tenant", None) or self.user
-        return f"Usage {self.key} for {subject}"
-
-    @staticmethod
-    def month_bounds(dt: date):
-        start = date(dt.year, dt.month, 1)
-        last_day = calendar.monthrange(dt.year, dt.month)[1]
-        end = date(dt.year, dt.month, last_day)
-        return start, end
+        return f"{self.credit_type}: {self.change}"
 
 
-def get_tenant_model():
-    if not TENANT_MODEL_LABEL:
-        return None
-    return apps.get_model(TENANT_MODEL_LABEL, require_ready=False)
+class ProcessedSubscriptionOrder(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order_reference = models.CharField(max_length=255, unique=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="processed_subscription_orders"
+    )
+    plan = models.ForeignKey(
+        SubscriptionPlan, on_delete=models.PROTECT, related_name="processed_orders"
+    )
+    processed_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        ordering = ["-processed_at"]
 
-def get_user_model():
-    return apps.get_model(USER_MODEL_LABEL, require_ready=False)
+    def __str__(self) -> str:
+        return f"{self.order_reference} -> {self.plan.key}"

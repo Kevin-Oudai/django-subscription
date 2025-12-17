@@ -1,62 +1,98 @@
 from django.contrib import admin
-from django.db import models
-from django.utils import timezone
 
-from . import conf
-from .models import EntitlementOverride, Plan, Subscription, SubscriptionStatus, UsageCounter
-
-
-@admin.register(Plan)
-class PlanAdmin(admin.ModelAdmin):
-    list_display = ("name", "slug", "is_active", "is_public", "sort_order")
-    search_fields = ("name", "slug")
-    list_filter = ("is_active", "is_public")
-    ordering = ("sort_order", "name")
-    formfield_overrides = {
-        models.JSONField: {"widget": admin.widgets.AdminTextareaWidget},
-    }
+from .models import (
+    ProcessedSubscriptionOrder,
+    SubscriptionCreditLedger,
+    SubscriptionPlan,
+    SubscriptionProduct,
+    SubscriptionStatus,
+    UserSubscription,
+)
+from .services import grant_featured_credits
 
 
-@admin.action(description="Set selected subscriptions to ACTIVE")
-def set_active(modeladmin, request, queryset):
-    queryset.update(status=SubscriptionStatus.ACTIVE)
-
-
-@admin.action(description="Set selected subscriptions to CANCELLED (ends now)")
-def set_cancelled(modeladmin, request, queryset):
-    now = timezone.now()
-    queryset.update(status=SubscriptionStatus.CANCELLED, ends_at=now)
-
-
-@admin.register(Subscription)
-class SubscriptionAdmin(admin.ModelAdmin):
+@admin.register(SubscriptionPlan)
+class SubscriptionPlanAdmin(admin.ModelAdmin):
     list_display = (
-        "id",
+        "name",
+        "key",
+        "billing_period",
+        "is_active",
+        "price_ttd",
+        "featured_credits_per_period",
+        "max_active_listings",
+    )
+    list_filter = ("billing_period", "is_active")
+    search_fields = ("name", "key")
+    ordering = ("name",)
+
+
+@admin.register(SubscriptionProduct)
+class SubscriptionProductAdmin(admin.ModelAdmin):
+    list_display = ("sku", "plan", "period_days", "is_active")
+    list_filter = ("is_active", "plan")
+    search_fields = ("sku",)
+    ordering = ("sku",)
+
+
+@admin.action(description="Mark selected subscriptions as expired")
+def expire_selected(modeladmin, request, queryset):
+    queryset.update(status=SubscriptionStatus.EXPIRED)
+
+
+@admin.action(description="Grant plan featured credits to selected subscriptions")
+def grant_plan_credits(modeladmin, request, queryset):
+    for subscription in queryset.select_related("plan"):
+        grant_featured_credits(subscription, reason="admin_grant")
+
+
+@admin.register(UserSubscription)
+class UserSubscriptionAdmin(admin.ModelAdmin):
+    list_display = (
+        "user",
         "plan",
         "status",
-        "starts_at",
-        "ends_at",
-        "trial_ends_at",
-        "grace_ends_at",
+        "current_period_end",
+        "last_paid_order_reference",
     )
     list_filter = ("status", "plan")
-    search_fields = ("external_reference",)
-    actions = (set_active, set_cancelled)
-    ordering = ("-starts_at",)
+    search_fields = ("user__username", "last_paid_order_reference")
+    actions = (expire_selected, grant_plan_credits)
+    ordering = ("-current_period_end",)
 
 
-if conf.overrides_enabled():
-    @admin.register(EntitlementOverride)
-    class EntitlementOverrideAdmin(admin.ModelAdmin):
-        list_display = ("id", "feature_key", "limit_key", "note", "created_at")
-        search_fields = ("feature_key", "limit_key", "note")
-        list_filter = ("feature_key",)
+@admin.register(SubscriptionCreditLedger)
+class SubscriptionCreditLedgerAdmin(admin.ModelAdmin):
+    list_display = ("user", "subscription", "credit_type", "change", "reason", "created_at")
+    list_filter = ("credit_type", "reason")
+    readonly_fields = (
+        "user",
+        "subscription",
+        "credit_type",
+        "change",
+        "reason",
+        "related_order_reference",
+        "related_listing_id",
+        "created_at",
+    )
+    search_fields = ("user__username", "reason", "related_order_reference")
+    ordering = ("-created_at",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
-if conf.usage_enabled():
-    @admin.register(UsageCounter)
-    class UsageCounterAdmin(admin.ModelAdmin):
-        list_display = ("key", "period_start", "period_end", "used")
-        list_filter = ("key", "period_start")
-        readonly_fields = ("key", "period_start", "period_end", "used", "created_at", "updated_at")
-        ordering = ("-period_start",)
+@admin.register(ProcessedSubscriptionOrder)
+class ProcessedSubscriptionOrderAdmin(admin.ModelAdmin):
+    list_display = ("order_reference", "user", "plan", "processed_at")
+    search_fields = ("order_reference", "user__username")
+    readonly_fields = ("order_reference", "user", "plan", "processed_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

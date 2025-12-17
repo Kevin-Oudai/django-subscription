@@ -1,158 +1,179 @@
 from django.conf import settings
 from django.db import migrations, models
-
-import subscriptions.conf as app_conf
-
-TENANT_MODEL_LABEL = app_conf.tenant_model_label()
-USER_MODEL_LABEL = app_conf.user_model_label()
-HAS_TENANT = TENANT_MODEL_LABEL is not None
-
-
-def subscription_fields():
-    fields = [
-        ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-        ("status", models.CharField(choices=[("TRIAL", "Trial"), ("ACTIVE", "Active"), ("PAST_DUE", "Past due"), ("GRACE", "Grace"), ("CANCELLED", "Cancelled"), ("EXPIRED", "Expired")], default="ACTIVE", max_length=20)),
-        ("starts_at", models.DateTimeField()),
-        ("ends_at", models.DateTimeField(blank=True, null=True)),
-        ("trial_ends_at", models.DateTimeField(blank=True, null=True)),
-        ("grace_ends_at", models.DateTimeField(blank=True, null=True)),
-        ("cancel_at_period_end", models.BooleanField(default=True)),
-        ("external_reference", models.CharField(blank=True, max_length=255)),
-        ("metadata", models.JSONField(blank=True, default=dict)),
-        ("created_at", models.DateTimeField(auto_now_add=True)),
-        ("updated_at", models.DateTimeField(auto_now=True)),
-        ("plan", models.ForeignKey(on_delete=models.PROTECT, related_name="subscriptions", to="subscriptions.plan")),
-    ]
-    if HAS_TENANT:
-        fields.append(
-            ("tenant", models.ForeignKey(blank=True, null=True, on_delete=models.CASCADE, related_name="subscription_subscriptions", to=TENANT_MODEL_LABEL)),
-        )
-    fields.append(
-        ("user", models.ForeignKey(blank=True, null=True, on_delete=models.CASCADE, related_name="subscription_user_subscriptions", to=USER_MODEL_LABEL)),
-    )
-    return fields
-
-
-def override_fields():
-    fields = [
-        ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-        ("feature_key", models.CharField(max_length=150)),
-        ("feature_enabled", models.BooleanField(null=True)),
-        ("limit_key", models.CharField(blank=True, max_length=150)),
-        ("limit_value", models.IntegerField(blank=True, null=True)),
-        ("note", models.CharField(blank=True, max_length=255)),
-        ("created_at", models.DateTimeField(auto_now_add=True)),
-        ("updated_at", models.DateTimeField(auto_now=True)),
-    ]
-    if HAS_TENANT:
-        fields.append(
-            ("tenant", models.ForeignKey(blank=True, null=True, on_delete=models.CASCADE, related_name="subscription_entitlement_overrides", to=TENANT_MODEL_LABEL)),
-        )
-    fields.append(
-        ("user", models.ForeignKey(blank=True, null=True, on_delete=models.CASCADE, related_name="subscription_user_entitlement_overrides", to=USER_MODEL_LABEL)),
-    )
-    return fields
-
-
-def usage_fields():
-    fields = [
-        ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-        ("key", models.CharField(max_length=150)),
-        ("period_start", models.DateField()),
-        ("period_end", models.DateField()),
-        ("used", models.PositiveIntegerField(default=0)),
-        ("created_at", models.DateTimeField(auto_now_add=True)),
-        ("updated_at", models.DateTimeField(auto_now=True)),
-    ]
-    if HAS_TENANT:
-        fields.append(
-            ("tenant", models.ForeignKey(blank=True, null=True, on_delete=models.CASCADE, related_name="subscription_usage_counters", to=TENANT_MODEL_LABEL)),
-        )
-    fields.append(
-        ("user", models.ForeignKey(blank=True, null=True, on_delete=models.CASCADE, related_name="subscription_user_usage_counters", to=USER_MODEL_LABEL)),
-    )
-    return fields
-
-
-def override_constraints():
-    constraints = [
-        models.UniqueConstraint(fields=["user", "feature_key"], name="subscriptions_feature_override_user"),
-        models.UniqueConstraint(fields=["user", "limit_key"], name="subscriptions_limit_override_user"),
-    ]
-    if HAS_TENANT:
-        constraints.extend(
-            [
-                models.UniqueConstraint(fields=["tenant", "feature_key"], name="subscriptions_feature_override_tenant"),
-                models.UniqueConstraint(fields=["tenant", "limit_key"], name="subscriptions_limit_override_tenant"),
-            ]
-        )
-    return constraints
-
-
-def usage_constraints():
-    constraints = [
-        models.UniqueConstraint(
-            fields=["user", "key", "period_start", "period_end"],
-            name="subscriptions_usage_user_period_key",
-        )
-    ]
-    if HAS_TENANT:
-        constraints.append(
-            models.UniqueConstraint(
-                fields=["tenant", "key", "period_start", "period_end"],
-                name="subscriptions_usage_tenant_period_key",
-            )
-        )
-    return constraints
+import django.db.models.deletion
+import uuid
 
 
 class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        migrations.swappable_dependency(USER_MODEL_LABEL),
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
-    if HAS_TENANT:
-        dependencies.append(migrations.swappable_dependency(TENANT_MODEL_LABEL))
 
     operations = [
         migrations.CreateModel(
-            name="Plan",
+            name="SubscriptionPlan",
             fields=[
-                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("id", models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ("key", models.SlugField(unique=True)),
                 ("name", models.CharField(max_length=150)),
-                ("slug", models.SlugField(unique=True)),
                 ("description", models.TextField(blank=True)),
+                ("price_ttd", models.DecimalField(decimal_places=2, max_digits=10)),
+                (
+                    "billing_period",
+                    models.CharField(
+                        choices=[("monthly", "Monthly"), ("yearly", "Yearly")], max_length=20
+                    ),
+                ),
                 ("is_active", models.BooleanField(default=True)),
-                ("is_public", models.BooleanField(default=True)),
-                ("sort_order", models.IntegerField(default=0)),
-                ("features", models.JSONField(blank=True, default=dict)),
-                ("limits", models.JSONField(blank=True, default=dict)),
+                ("max_active_listings", models.IntegerField(blank=True, null=True)),
+                ("featured_credits_per_period", models.PositiveIntegerField(default=0)),
+                ("badge_label", models.CharField(blank=True, max_length=150)),
+                ("priority_support", models.BooleanField(default=False)),
+                ("can_add_multiple_staff", models.BooleanField(default=False)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
             ],
-            options={"ordering": ["sort_order", "slug"]},
-        ),
-        migrations.CreateModel(
-            name="Subscription",
-            fields=subscription_fields(),
-            options={"ordering": ["-starts_at", "-created_at"], "indexes": [models.Index(fields=["status", "starts_at"], name="subscripti_status_1b082c_idx")]},
-        ),
-        migrations.CreateModel(
-            name="EntitlementOverride",
-            fields=override_fields(),
-            options={"constraints": override_constraints()},
-        ),
-        migrations.CreateModel(
-            name="UsageCounter",
-            fields=usage_fields(),
             options={
-                "ordering": ["-period_start", "-created_at"],
-                "constraints": usage_constraints(),
+                "ordering": ["name"],
             },
         ),
-        migrations.AddIndex(
-            model_name="plan",
-            index=models.Index(fields=["is_active", "sort_order"], name="plan_is_acti_7a8923_idx"),
+        migrations.CreateModel(
+            name="UserSubscription",
+            fields=[
+                ("id", models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                (
+                    "status",
+                    models.CharField(
+                        choices=[
+                            ("active", "Active"),
+                            ("expired", "Expired"),
+                            ("cancelled", "Cancelled"),
+                        ],
+                        default="active",
+                        max_length=20,
+                    ),
+                ),
+                ("started_at", models.DateTimeField()),
+                ("current_period_start", models.DateTimeField()),
+                ("current_period_end", models.DateTimeField(db_index=True)),
+                ("cancelled_at", models.DateTimeField(blank=True, null=True)),
+                ("last_paid_order_reference", models.CharField(blank=True, db_index=True, max_length=255)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+                (
+                    "plan",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name="user_subscriptions",
+                        to="subscriptions.subscriptionplan",
+                    ),
+                ),
+                (
+                    "user",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="subscriptions",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
+            ],
+            options={
+                "ordering": ["-current_period_end", "-created_at"],
+            },
+        ),
+        migrations.CreateModel(
+            name="SubscriptionProduct",
+            fields=[
+                ("id", models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ("sku", models.CharField(max_length=150, unique=True)),
+                ("period_days", models.PositiveIntegerField()),
+                ("is_active", models.BooleanField(default=True)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+                (
+                    "plan",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name="products",
+                        to="subscriptions.subscriptionplan",
+                    ),
+                ),
+            ],
+            options={
+                "ordering": ["sku"],
+            },
+        ),
+        migrations.CreateModel(
+            name="ProcessedSubscriptionOrder",
+            fields=[
+                ("id", models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ("order_reference", models.CharField(max_length=255, unique=True)),
+                ("processed_at", models.DateTimeField(auto_now_add=True)),
+                (
+                    "plan",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name="processed_orders",
+                        to="subscriptions.subscriptionplan",
+                    ),
+                ),
+                (
+                    "user",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="processed_subscription_orders",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
+            ],
+            options={
+                "ordering": ["-processed_at"],
+            },
+        ),
+        migrations.CreateModel(
+            name="SubscriptionCreditLedger",
+            fields=[
+                ("id", models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                (
+                    "credit_type",
+                    models.CharField(
+                        choices=[("featured", "Featured")], max_length=50
+                    ),
+                ),
+                ("change", models.IntegerField()),
+                ("reason", models.CharField(max_length=255)),
+                ("related_order_reference", models.CharField(blank=True, max_length=255, null=True)),
+                ("related_listing_id", models.UUIDField(blank=True, null=True)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                (
+                    "subscription",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name="credit_entries",
+                        to="subscriptions.usersubscription",
+                    ),
+                ),
+                (
+                    "user",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="subscription_credit_entries",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
+            ],
+            options={
+                "ordering": ["-created_at"],
+            },
+        ),
+        migrations.AddConstraint(
+            model_name="usersubscription",
+            constraint=models.UniqueConstraint(
+                condition=models.Q(status="active"),
+                fields=("user",),
+                name="unique_active_subscription_per_user",
+            ),
         ),
     ]
